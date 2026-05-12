@@ -983,6 +983,10 @@ class LlamaModel(LlamaPreTrainedModel):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
 
+        self.all_FLOPs = 0
+        self.total_cuda_time = 0
+        self.num_forward = 0
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1005,6 +1009,10 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        fastv_k: Optional[int] = None,
+        fastv_r: Optional[int] = None,
+        img_start: Optional[int] = None,
+        img_end: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1053,9 +1061,21 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        fastv_enabled = fastv_k is not None and fastv_r is not None and img_start is not None and img_end is not None
+        fastv_pruned = False
+
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            # Accumulate FLOPs (skip decoding steps where seq_len == 1)
+            if hidden_states.shape[1] != 1:
+                n = hidden_states.shape[1]
+                d = hidden_states.shape[2]
+                m = self.layers[layer_idx].mlp.up_proj.out_features
+                self.all_FLOPs += 4 * n * (d**2) + 2 * (n**2) * d + 3 * n * d * m
+
+            need_attn = output_attentions or (fastv_enabled and layer_idx == fastv_r and not fastv_pruned)
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1064,7 +1084,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     causal_mask,
                     position_ids,
                     past_key_values,
-                    output_attentions,
+                    need_attn,
                     use_cache,
                     cache_position,
                 )
@@ -1074,7 +1094,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
-                    output_attentions=output_attentions,
+                    output_attentions=need_attn,
                     use_cache=use_cache,
                     cache_position=cache_position,
                 )
@@ -1082,10 +1102,40 @@ class LlamaModel(LlamaPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                next_decoder_cache = layer_outputs[2 if need_attn else 1]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
+            # === FastV pruning — runs exactly once, right after layer fastv_r ===
+            if fastv_enabled and layer_idx == fastv_r and not fastv_pruned:
+                attn_weights = layer_outputs[1]  # (1, heads, seq_len, seq_len)
+                num_vis  = img_end - img_start
+                num_cams = max(1, num_vis // 256)
+
+                keep_vis = []
+                for cam in range(num_cams):
+                    cam_s = img_start + cam * 256
+                    # Mean attention: text token rows → this camera's 256 visual columns
+                    text_to_vis = attn_weights[0, :, img_end:, cam_s:cam_s + 256].float()  # (heads, n_text, 256)
+                    scores  = text_to_vis.mean(dim=(0, 1))                                  # (256,)
+                    top_idx = torch.topk(scores, fastv_k).indices + cam_s                   # absolute positions
+                    keep_vis.append(top_idx)
+
+                vis_keep   = torch.cat(keep_vis).sort().values                    # sorted absolute visual indices
+                bos        = torch.tensor([0], device=hidden_states.device)
+                text_range = torch.arange(img_end, hidden_states.shape[1], device=hidden_states.device)
+                keep_all   = torch.cat([bos, vis_keep, text_range])               # (1 + fastv_k*num_cams + n_text,)
+
+                hidden_states = hidden_states[:, keep_all, :]
+                position_ids  = position_ids[:, keep_all]
+                if cache_position is not None:
+                    cache_position = cache_position[keep_all]
+                causal_mask   = self._update_causal_mask(None, hidden_states, cache_position, 0)
+                fastv_pruned  = True
+
+        if hidden_states.shape[1] != 1:
+            self.num_forward += 1
 
         hidden_states = self.norm(hidden_states)
 
@@ -1226,6 +1276,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        fastv_k: Optional[int] = None,
+        fastv_r: Optional[int] = None,
+        img_start: Optional[int] = None,
+        img_end: Optional[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1270,6 +1324,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            fastv_k=fastv_k,
+            fastv_r=fastv_r,
+            img_start=img_start,
+            img_end=img_end,
         )
 
         hidden_states = outputs[0]
