@@ -1011,6 +1011,7 @@ class LlamaModel(LlamaPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         fastv_k: Optional[int] = None,
         fastv_r: Optional[int] = None,
+        fastv_per_camera: Optional[bool] = True,
         img_start: Optional[int] = None,
         img_end: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
@@ -1113,19 +1114,28 @@ class LlamaModel(LlamaPreTrainedModel):
                 num_vis  = img_end - img_start
                 num_cams = max(1, num_vis // 256)
 
-                keep_vis = []
-                for cam in range(num_cams):
-                    cam_s = img_start + cam * 256
-                    # Mean attention: text token rows → this camera's 256 visual columns
-                    text_to_vis = attn_weights[0, :, img_end:, cam_s:cam_s + 256].float()  # (heads, n_text, 256)
-                    scores  = text_to_vis.mean(dim=(0, 1))                                  # (256,)
-                    top_idx = torch.topk(scores, fastv_k).indices + cam_s                   # absolute positions
-                    keep_vis.append(top_idx)
+                if fastv_per_camera:
+                    # --- Per-camera mode: keep fastv_k tokens independently per camera ---
+                    keep_vis = []
+                    for cam in range(num_cams):
+                        cam_s = img_start + cam * 256
+                        # Mean attention: text token rows → this camera's 256 visual columns
+                        text_to_vis = attn_weights[0, :, img_end:, cam_s:cam_s + 256].float()  # (heads, n_text, 256)
+                        scores  = text_to_vis.mean(dim=(0, 1))                                  # (256,)
+                        top_idx = torch.topk(scores, fastv_k).indices + cam_s                   # absolute positions
+                        keep_vis.append(top_idx)
+                    vis_keep = torch.cat(keep_vis).sort().values  # (fastv_k * num_cams,)
+                else:
+                    # --- Global mode: score all visual tokens jointly, keep top fastv_k ---
+                    text_to_vis = attn_weights[0, :, img_end:, img_start:img_end].float()  # (heads, n_text, num_vis)
+                    scores  = text_to_vis.mean(dim=(0, 1))                                  # (num_vis,)
+                    k_global = min(fastv_k, num_vis)
+                    vis_keep = torch.topk(scores, k_global).indices + img_start             # absolute positions
+                    vis_keep = vis_keep.sort().values                                        # (k_global,)
 
-                vis_keep   = torch.cat(keep_vis).sort().values                    # sorted absolute visual indices
                 bos        = torch.tensor([0], device=hidden_states.device)
                 text_range = torch.arange(img_end, hidden_states.shape[1], device=hidden_states.device)
-                keep_all   = torch.cat([bos, vis_keep, text_range])               # (1 + fastv_k*num_cams + n_text,)
+                keep_all   = torch.cat([bos, vis_keep, text_range])
 
                 hidden_states = hidden_states[:, keep_all, :]
                 position_ids  = position_ids[:, keep_all]
@@ -1278,6 +1288,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         fastv_k: Optional[int] = None,
         fastv_r: Optional[int] = None,
+        fastv_per_camera: Optional[bool] = True,
         img_start: Optional[int] = None,
         img_end: Optional[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -1326,6 +1337,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             cache_position=cache_position,
             fastv_k=fastv_k,
             fastv_r=fastv_r,
+            fastv_per_camera=fastv_per_camera,
             img_start=img_start,
             img_end=img_end,
         )
