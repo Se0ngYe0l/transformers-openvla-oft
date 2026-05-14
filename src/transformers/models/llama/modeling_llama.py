@@ -983,6 +983,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
 
+        self.pruning_loc = [2, 6, 9, 11]
         self.all_FLOPs = 0
         self.total_cuda_time = 0
         self.num_forward = 0
@@ -1009,11 +1010,10 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        use_fastv: Optional[bool] = False,
         fastv_k: Optional[int] = None,
         fastv_r: Optional[int] = None,
         fastv_per_camera: Optional[bool] = True,
-        img_start: Optional[int] = None,
-        img_end: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1062,9 +1062,6 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        fastv_enabled = fastv_k is not None and fastv_r is not None and img_start is not None and img_end is not None
-        fastv_pruned = False
-
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1076,8 +1073,6 @@ class LlamaModel(LlamaPreTrainedModel):
                 m = self.layers[layer_idx].mlp.up_proj.out_features
                 self.all_FLOPs += 4 * n * (d**2) + 2 * (n**2) * d + 3 * n * d * m
 
-            need_attn = output_attentions or (fastv_enabled and layer_idx == fastv_r and not fastv_pruned)
-
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
@@ -1085,17 +1080,46 @@ class LlamaModel(LlamaPreTrainedModel):
                     causal_mask,
                     position_ids,
                     past_key_values,
-                    need_attn,
+                    output_attentions,
                     use_cache,
                     cache_position,
                 )
             else:
+                if use_fastv:
+                    if layer_idx < fastv_r:
+                        new_attention_mask = causal_mask
+                        output_attentions = True
+                        all_self_attns = ()
+                    elif layer_idx == fastv_r:
+                        attn_weights = layer_outputs[1] # (batch, heads, seqs, seqs)
+                        last_attn_weights_avg = torch.mean(attn_weights, dim=1)[0] # (seqs, seqs)
+                        last_attn_weights_avg_last_tok = last_attn_weights_avg[-1]
+
+                        last_attn_weights_avg_last_tok_image = last_attn_weights_avg_last_tok[1:1+256*2]
+
+                        top_attention_rank_index = last_attn_weights_avg_last_tok_image.topk(fastv_k).indices + 1
+
+                        keep_indexs = torch.cat((torch.arange(1,device=inputs_embeds.device), top_attention_rank_index, torch.arange(1+256*2,inputs_embeds.shape[1],device=inputs_embeds.device)))
+                        keep_indexs = keep_indexs.sort().values
+                        new_seq_length = keep_indexs.shape[0]
+                        
+                        hidden_states = hidden_states[:,keep_indexs,:]
+                        position_ids = keep_indexs.unsqueeze(0)
+
+                        cache_position = torch.arange(new_seq_length, device=inputs_embeds.device)
+                        new_attention_mask = self._update_causal_mask(None, hidden_states, cache_position, 0)
+
+                        output_attentions = False
+                        all_self_attns = None
+                else:
+                    new_attention_mask = causal_mask
+
                 layer_outputs = decoder_layer(
                     hidden_states,
-                    attention_mask=causal_mask,
+                    attention_mask=new_attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
-                    output_attentions=need_attn,
+                    output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
                 )
@@ -1103,46 +1127,10 @@ class LlamaModel(LlamaPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if need_attn else 1]
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-
-            # === FastV pruning — runs exactly once, right after layer fastv_r ===
-            if fastv_enabled and layer_idx == fastv_r and not fastv_pruned:
-                attn_weights = layer_outputs[1]  # (1, heads, seq_len, seq_len)
-                num_vis  = img_end - img_start
-                num_cams = max(1, num_vis // 256)
-
-                if fastv_per_camera:
-                    # --- Per-camera mode: keep fastv_k tokens independently per camera ---
-                    keep_vis = []
-                    for cam in range(num_cams):
-                        cam_s = img_start + cam * 256
-                        # Mean attention: text token rows → this camera's 256 visual columns
-                        text_to_vis = attn_weights[0, :, img_end:, cam_s:cam_s + 256].float()  # (heads, n_text, 256)
-                        scores  = text_to_vis.mean(dim=(0, 1))                                  # (256,)
-                        top_idx = torch.topk(scores, fastv_k).indices + cam_s                   # absolute positions
-                        keep_vis.append(top_idx)
-                    vis_keep = torch.cat(keep_vis).sort().values  # (fastv_k * num_cams,)
-                else:
-                    # --- Global mode: score all visual tokens jointly, keep top fastv_k ---
-                    text_to_vis = attn_weights[0, :, img_end:, img_start:img_end].float()  # (heads, n_text, num_vis)
-                    scores  = text_to_vis.mean(dim=(0, 1))                                  # (num_vis,)
-                    k_global = min(fastv_k, num_vis)
-                    vis_keep = torch.topk(scores, k_global).indices + img_start             # absolute positions
-                    vis_keep = vis_keep.sort().values                                        # (k_global,)
-
-                bos        = torch.tensor([0], device=hidden_states.device)
-                text_range = torch.arange(img_end, hidden_states.shape[1], device=hidden_states.device)
-                keep_all   = torch.cat([bos, vis_keep, text_range])
-
-                hidden_states = hidden_states[:, keep_all, :]
-                position_ids  = position_ids[:, keep_all]
-                if cache_position is not None:
-                    cache_position = cache_position[keep_all]
-                causal_mask   = self._update_causal_mask(None, hidden_states, cache_position, 0)
-                fastv_pruned  = True
 
         if hidden_states.shape[1] != 1:
             self.num_forward += 1
@@ -1286,11 +1274,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        use_fastv: Optional[bool] = None,
         fastv_k: Optional[int] = None,
         fastv_r: Optional[int] = None,
         fastv_per_camera: Optional[bool] = True,
-        img_start: Optional[int] = None,
-        img_end: Optional[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1335,11 +1322,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            use_fastv=use_fastv,
             fastv_k=fastv_k,
             fastv_r=fastv_r,
-            fastv_per_camera=fastv_per_camera,
-            img_start=img_start,
-            img_end=img_end,
+            fastv_per_camera=fastv_per_camera
         )
 
         hidden_states = outputs[0]
