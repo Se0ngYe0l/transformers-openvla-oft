@@ -85,6 +85,7 @@ class DynamicCache(Cache):
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
+        self.cache_position: torch.Tensor = None
 
     def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
         """
@@ -135,24 +136,59 @@ class DynamicCache(Cache):
             A tuple containing the updated key and value states.
         """
         # Update the number of seen tokens
+        if cache_kwargs is not None:
+            cache_position = cache_kwargs.get("cache_position", None)
+        else: 
+            cache_position = torch.arange(key_states.size(-2), device=key_states.device)
+
         if layer_idx == 0:
-            self._seen_tokens += key_states.shape[-2]
+            if self._seen_tokens == 0:
+                self._seen_tokens += key_states.shape[-2]
+            elif key_states.shape[-2] == 1:
+                self._seen_tokens += 1
+            
+
+            if self.cache_position is None and cache_position is not None:
+                self.cache_position = cache_position.unsqueeze(0)
+            elif cache_position is not None and cache_position.size(-1) == 1:
+                self.cache_position = torch.cat([self.cache_position, cache_position.unsqueeze(0)], dim=-1)
 
         # Update the cache
-        if len(self.key_cache) <= layer_idx:
-            self.key_cache.append(key_states)
-            self.value_cache.append(value_states)
-        else:
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
-
+        if key_states is not None:
+            assert cache_position.size(-1) <= self._seen_tokens , f"cache_position: {cache_position.size(-1)} seen_tokens: {self._seen_tokens}"
+            if len(self.key_cache) <= layer_idx:
+                # There may be skipped layers, fill them with empty lists
+                for _ in range(len(self.key_cache), layer_idx):
+                    self.key_cache.append([])
+                    self.value_cache.append([])
+                self.key_cache.append(key_states)
+                self.value_cache.append(value_states)
+            elif (
+                len(self.key_cache[layer_idx]) == 0
+            ):  # fills previously skipped layers; checking for tensor causes errors
+                self.key_cache[layer_idx] = key_states
+                self.value_cache[layer_idx] = value_states
+            elif cache_position.size(-1) <= self._seen_tokens and cache_position.size(-1) != 1:
+                self.key_cache[layer_idx].index_copy_(2, cache_position, key_states)
+                self.value_cache[layer_idx].index_copy_(2, cache_position, value_states)
+            elif cache_position.size(-1) == 1:
+                self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+                self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
+            else:  
+                print(f"cache_position: {cache_position.size(-1)} seen_tokens: {self._seen_tokens}")
+                
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
-        if len(self.key_cache) <= layer_idx:
-            return 0
-        return self.key_cache[layer_idx].shape[-2]
+        # TODO: deprecate this function in favor of `cache_position`
+        is_empty_layer = (
+            len(self.key_cache) == 0  # no cache in any layer
+            or len(self.key_cache) <= layer_idx  # skipped `layer_idx` and hasn't run a layer with cache after it
+            or len(self.key_cache[layer_idx]) == 0  # the layer has no cache
+        )
+        layer_seq_length = self.key_cache[layer_idx].shape[-2] if not is_empty_layer else 0
+        return layer_seq_length
 
     def get_max_length(self) -> Optional[int]:
         """Returns the maximum sequence length of the cached states. DynamicCache does not have a maximum length."""

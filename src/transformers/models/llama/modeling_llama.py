@@ -1040,7 +1040,7 @@ class LlamaModel(LlamaPreTrainedModel):
         if use_cache:  # kept for BC (cache positions)
             if not isinstance(past_key_values, StaticCache):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-                past_seen_tokens = past_key_values.get_seq_length()
+                past_seen_tokens = past_key_values.get_seq_length() if getattr(self.config, "proportion_attn_var", None) is None else 0
 
         if cache_position is None:
             if isinstance(past_key_values, StaticCache):
@@ -1052,19 +1052,45 @@ class LlamaModel(LlamaPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens)
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens, output_attentions)
 
         # embed positions
         hidden_states = inputs_embeds
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
+        all_self_attns = ()
         next_decoder_cache = None
+        last_reusable_patches = None
 
         for layer_idx, decoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+            
+            if getattr(self.config, "proportion_attn_var", None) is not None and inputs_embeds.size(1) != 1 and layer_idx in self.pruning_loc:
+                reusable_patches = self.config.reusable_patches
+                proportion = self.config.proportion_attn_var[layer_idx]
+                top_k = max(1, int(proportion * len(reusable_patches)))
+                selected_reusable_patches = reusable_patches[:top_k]
+                
+                if last_reusable_patches is None:
+                    last_reusable_patches = selected_reusable_patches
+
+                if last_reusable_patches.size(0) <= selected_reusable_patches.size(0):
+                    
+                    dtype, device = inputs_embeds.dtype, inputs_embeds.device
+                    bs,seq_length = inputs_embeds.shape[0], inputs_embeds.shape[1]
+                    full_position = torch.arange(seq_length, device=inputs_embeds.device)
+                    mask = ~torch.isin(cache_position, selected_reusable_patches)
+                    new_cache_position = cache_position[mask]
+                    new_cache_position, _ = new_cache_position.sort()
+                    assert new_cache_position.size(0) + selected_reusable_patches.size(0) == seq_length, f"{new_cache_position.size(0)} + {selected_reusable_patches.size(0)} != {seq_length}"
+                    
+                    if causal_mask is not None:
+                        causal_mask = causal_mask[..., mask, :]
+                    hidden_states = hidden_states[..., mask, :]
+                    position_ids = new_cache_position.unsqueeze(0)
+                    
+                    cache_position = new_cache_position
+                    last_reusable_patches = selected_reusable_patches
 
             # Accumulate FLOPs (skip decoding steps where seq_len == 1)
             if hidden_states.shape[1] != 1:
@@ -1072,6 +1098,9 @@ class LlamaModel(LlamaPreTrainedModel):
                 d = hidden_states.shape[2]
                 m = self.layers[layer_idx].mlp.up_proj.out_features
                 self.all_FLOPs += 4 * n * (d**2) + 2 * (n**2) * d + 3 * n * d * m
+
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1107,7 +1136,7 @@ class LlamaModel(LlamaPreTrainedModel):
                         position_ids = keep_indexs.unsqueeze(0)
 
                         cache_position = torch.arange(new_seq_length, device=inputs_embeds.device)
-                        new_attention_mask = self._update_causal_mask(None, hidden_states, cache_position, 0)
+                        new_attention_mask = self._update_causal_mask(None, hidden_states, cache_position, 0, output_attentions)
 
                         output_attentions = False
                         all_self_attns = None
@@ -1135,17 +1164,18 @@ class LlamaModel(LlamaPreTrainedModel):
         if hidden_states.shape[1] != 1:
             self.num_forward += 1
 
+        # vla-cache
+        if use_cache and output_attentions:
+            all_self_attns += (cache_position,)
+
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = None
-        if use_cache:
-            next_cache = (
-                next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
-            )
+        next_cache = next_decoder_cache if use_cache else None
+
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
@@ -1161,6 +1191,7 @@ class LlamaModel(LlamaPreTrainedModel):
         input_tensor: torch.Tensor,
         cache_position: torch.Tensor,
         past_seen_tokens: int,
+        output_attentions: bool,
     ):
         # TODO: As of torch==2.2.0, the `attention_mask` passed to the model in `generate` is 2D and of dynamic length even when the static
         # KV cache is used. This is an issue for torch.compile which then recaptures cudagraphs at each decode steps due to the dynamic shapes.
@@ -1171,8 +1202,8 @@ class LlamaModel(LlamaPreTrainedModel):
             if attention_mask is not None and 0.0 in attention_mask:
                 return attention_mask
             return None
-
-        if self.config._attn_implementation == "sdpa":
+        output_attentions = False
+        if self.config._attn_implementation == "sdpa" and not output_attentions:
             # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument,
             # in order to dispatch on Flash Attention 2.
             if AttentionMaskConverter._ignore_causal_mask_sdpa(
@@ -1220,6 +1251,7 @@ class LlamaModel(LlamaPreTrainedModel):
             self.config._attn_implementation == "sdpa"
             and attention_mask is not None
             and attention_mask.device.type == "cuda"
+            and not output_attentions
         ):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
