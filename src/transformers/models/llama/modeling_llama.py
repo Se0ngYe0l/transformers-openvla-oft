@@ -1014,6 +1014,11 @@ class LlamaModel(LlamaPreTrainedModel):
         fastv_k: Optional[int] = None,
         fastv_r: Optional[int] = None,
         fastv_per_camera: Optional[bool] = True,
+        use_efficientvla: Optional[bool] = False,
+        efficientvla_k_final: Optional[int] = None,
+        efficientvla_k_key: Optional[int] = None,
+        efficientvla_alpha: Optional[float] = None,
+        efficientvla_prune_layer: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1064,7 +1069,12 @@ class LlamaModel(LlamaPreTrainedModel):
         last_reusable_patches = None
 
         for layer_idx, decoder_layer in enumerate(self.layers):
-            
+
+            # EfficientVLA §3.2: skip layers with low importance (offline-computed, set via config)
+            _pruned_layers = getattr(self.config, 'llm_pruned_layer_indices', None)
+            if _pruned_layers and layer_idx in _pruned_layers:
+                continue  # identity pass-through; hidden_states unchanged
+
             if getattr(self.config, "proportion_attn_var", None) is not None and inputs_embeds.size(1) != 1 and layer_idx in self.pruning_loc:
                 reusable_patches = self.config.reusable_patches
                 proportion = self.config.proportion_attn_var[layer_idx]
@@ -1140,6 +1150,66 @@ class LlamaModel(LlamaPreTrainedModel):
 
                         output_attentions = False
                         all_self_attns = None
+                elif use_efficientvla:
+                    if layer_idx < efficientvla_prune_layer:
+                        new_attention_mask = causal_mask
+                        output_attentions = True
+                        all_self_attns = ()
+                    elif layer_idx == efficientvla_prune_layer:
+                        # --- Use attention from the PREVIOUS layer (already in layer_outputs) ---
+                        attn_weights = layer_outputs[1]          # (1, H, S, S)
+                        n_vis = 512      # e.g. 512 for 2 cameras
+                        vis_s, vis_e = 1, 1 + n_vis             # BOS=0, vis=1..vis_e
+
+                        # Task relevance: mean attention from text/action tokens → each visual token
+                        # attn[b, h, j, i]: token j attends to token i  (causal LM: j > i is valid)
+                        text_to_vis = attn_weights[0, :, vis_e:, vis_s:vis_e]  # (H, T_text, n_vis)
+                        task_rel   = text_to_vis.mean(0).sum(0)                 # (n_vis,)
+                        r_min, r_max = task_rel.min(), task_rel.max()
+                        scores = (task_rel - r_min) / (r_max - r_min + 1e-8)
+
+                        k_key   = efficientvla_k_key
+                        k_aug   = efficientvla_k_final - k_key
+                        k_task  = int(efficientvla_alpha * k_aug)
+                        k_div   = k_aug - k_task
+
+                        # V_key: top-k_key by task relevance
+                        vkey_idx = scores.topk(k_key).indices
+
+                        # V_rem: everything not in V_key
+                        mask_rem = torch.ones(n_vis, dtype=torch.bool, device=scores.device)
+                        mask_rem[vkey_idx] = False
+                        vrem_idx = torch.where(mask_rem)[0]
+
+                        # V_task: top-k_task from V_rem by relevance
+                        vtask_idx = vrem_idx[scores[vrem_idx].topk(min(k_task, len(vrem_idx))).indices]
+
+                        # V_div: top-k_div from remaining by cosine distance to V_key
+                        vtask_set = set(vtask_idx.tolist())
+                        vrem2_idx = vrem_idx[torch.tensor([i not in vtask_set
+                                                        for i in vrem_idx.tolist()], device=scores.device)]
+                        vis_feats  = hidden_states[0, vis_s:vis_e, :]            # (n_vis, D)
+                        nrm = vis_feats / (vis_feats.norm(dim=-1, keepdim=True) + 1e-8)
+                        cos_sim    = torch.mm(nrm[vrem2_idx], nrm[vkey_idx].t()) # (|rem2|, k_key)
+                        diversity  = 1 - cos_sim.max(dim=-1).values              # (|rem2|,)
+                        vdiv_idx   = vrem2_idx[diversity.topk(min(k_div, len(vrem2_idx))).indices]
+
+                        # V_pruned = V_key ∪ V_task ∪ V_div  (absolute sequence positions)
+                        pruned_abs = (torch.cat([vkey_idx, vtask_idx, vdiv_idx]).unique() + vis_s).sort().values
+                        keep_idx   = torch.cat([
+                            torch.arange(vis_s, device=hidden_states.device),           # BOS
+                            pruned_abs,
+                            torch.arange(vis_e, hidden_states.shape[1], device=hidden_states.device)  # text+action
+                        ]).sort().values
+
+                        hidden_states = hidden_states[:, keep_idx, :]
+                        new_seq_len   = keep_idx.shape[0]
+                        cache_position = torch.arange(new_seq_len, device=hidden_states.device)
+                        position_ids   = cache_position.unsqueeze(0)
+                        new_attention_mask = self._update_causal_mask(
+                            None, hidden_states, cache_position, 0, False)
+                        output_attentions = False
+                        all_self_attns    = None
                 else:
                     new_attention_mask = causal_mask
 
@@ -1310,6 +1380,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         fastv_k: Optional[int] = None,
         fastv_r: Optional[int] = None,
         fastv_per_camera: Optional[bool] = True,
+        use_efficientvla: Optional[bool] = False,
+        efficientvla_k_final: Optional[int] = None,
+        efficientvla_k_key: Optional[int] = None,
+        efficientvla_alpha: Optional[float] = None,
+        efficientvla_prune_layer: Optional[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1357,8 +1432,26 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             use_fastv=use_fastv,
             fastv_k=fastv_k,
             fastv_r=fastv_r,
-            fastv_per_camera=fastv_per_camera
+            fastv_per_camera=fastv_per_camera,
+            use_efficientvla=use_efficientvla,
+            efficientvla_k_final=efficientvla_k_final,
+            efficientvla_k_key=efficientvla_k_key,
+            efficientvla_alpha=efficientvla_alpha,
+            efficientvla_prune_layer=efficientvla_prune_layer,
         )
+
+        # if output_hidden_states and outputs.hidden_states is not None:
+        #     hs = outputs.hidden_states  # tuple of (num_layers+1) tensors
+        #     num_layers = len(hs) - 1
+        #     importance = []
+        #     for layer_idx in range(num_layers):
+        #         x_in  = hs[layer_idx].float()
+        #         x_out = hs[layer_idx + 1].float()
+        #         cos   = F.cosine_similarity(x_in, x_out, dim=-1).mean().item()
+        #         importance.append(1.0 - cos)
+        #     ranked = sorted(range(num_layers), key=lambda i: importance[i])
+        #     print(f"  6 least important layers: {ranked[:6]}  (importance: {[round(importance[i], 4) for i in ranked[:6]]})")
+
 
         hidden_states = outputs[0]
         if self.config.pretraining_tp > 1:
