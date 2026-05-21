@@ -1019,6 +1019,13 @@ class LlamaModel(LlamaPreTrainedModel):
         efficientvla_k_key: Optional[int] = None,
         efficientvla_alpha: Optional[float] = None,
         efficientvla_prune_layer: Optional[int] = None,
+        use_mine: Optional[bool] = False,
+        mine_prune_layer: Optional[int] = None,
+        mine_k: Optional[int] = None,
+        mine_head_mode: Optional[str] = 'entropy_weighted',
+        use_adaptinfer: Optional[bool] = False,
+        adaptinfer_prune_layer: Optional[int] = None,
+        adaptinfer_k: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1210,6 +1217,124 @@ class LlamaModel(LlamaPreTrainedModel):
                             None, hidden_states, cache_position, 0, False)
                         output_attentions = False
                         all_self_attns    = None
+                elif use_mine:
+                    # ── Proprio-guided Visual Token Pruning ────────────────────────────
+                    # Token layout: [BOS(0)] [Visual 1..vis_e-1] [Proprio vis_e] [Text vis_e+1..]
+                    # Causal attention: proprio CAN attend to visual tokens.
+                    # We score each visual token by how much the proprio token attends to it.
+                    if layer_idx < mine_prune_layer:
+                        new_attention_mask = causal_mask
+                        output_attentions = True
+                        all_self_attns = ()
+                    elif layer_idx == mine_prune_layer:
+                        # layer_outputs[1]: attention from the previous layer (mine_prune_layer - 1)
+                        # shape: (batch=1, H, seq_len, seq_len)
+                        attn = layer_outputs[1]
+                        n_vis    = 512
+                        vis_s    = 1
+                        vis_e    = vis_s + n_vis   # 513  (proprio sits here)
+                        proprio_pos = vis_e        # index of proprio token in sequence
+
+                        # ── Proprio → Visual attention ────────────────────────────────
+                        # attn[b, head, query, key]: proprio (row) attending to visual (cols)
+
+                        last_attn_weights_avg = torch.mean(attn, dim=1)[0]
+
+                        # score = last_attn_weights_avg[proprio_pos, vis_s:vis_e]   # (H, n_vis)
+
+                        ###                        
+                        score = last_attn_weights_avg[1+256*2+1:, proprio_pos]
+                        
+                        # 1. text_to_proprio를 weighting distribution으로 정규화
+                        text_to_proprio_w = score / (score.sum() + 1e-8)   # (n_text,)
+
+                        # 2. 각 text token이 visual token에 주는 attention
+                        text_s = vis_e + 1   # 514
+                        text_to_vis = last_attn_weights_avg[text_s:, vis_s:vis_e]  # (n_text, n_vis=512)
+
+                        # 3. proprio를 많이 보는 text token일수록 visual vote에 높은 가중치
+                        visual_score = (text_to_proprio_w[:, None] * text_to_vis).sum(0)  # (512,)
+
+                        # 4. per-camera topk
+                        cam1_keep = visual_score[:256].topk(mine_k // 2).indices + 1
+                        cam2_keep = visual_score[256:].topk(mine_k // 2).indices + 1 + 256
+                        keep_vis_rel = torch.cat([cam1_keep, cam2_keep])
+                        ###
+
+                        # keep_vis_rel = score.topk(mine_k).indices + 1
+                        
+                        # cam1_keep_vis_rel = score[:256].topk(mine_k // 2).indices + 1             # (mine_k,)
+                        # cam2_keep_vis_rel = score[256:].topk(mine_k // 2).indices + 1 + 256
+                        # keep_vis_rel = torch.cat([cam1_keep_vis_rel, cam2_keep_vis_rel])
+
+                        self.config.mine_kept_vis_indices = keep_vis_rel.cpu()
+                        self.config.mine_vis_scores    = visual_score.cpu()  # (512,) per-visual-token score
+                        self.config.mine_phase_weights = score.cpu()         # (n_text,) instruction cursor
+
+                        keep_indexs = torch.cat((torch.arange(1,device=inputs_embeds.device), keep_vis_rel, torch.arange(1+256*2,inputs_embeds.shape[1],device=inputs_embeds.device)))
+                        keep_indexs = keep_indexs.sort().values
+                        new_seq_length = keep_indexs.shape[0]
+                        
+                        hidden_states = hidden_states[:,keep_indexs,:]
+                        position_ids = keep_indexs.unsqueeze(0)
+
+                        cache_position = torch.arange(new_seq_length, device=inputs_embeds.device)
+                        new_attention_mask = self._update_causal_mask(None, hidden_states, cache_position, 0, output_attentions)
+
+                        output_attentions = False
+                        all_self_attns = None
+                elif use_adaptinfer:
+                    # ── AdaptInfer Baseline: t2t-weighted Visual Token Pruning ──────────
+                    # Token layout: [BOS(0)] [Visual 1..512] [Proprio 513] [Text 514..]
+                    # Scoring: text→text attention weights the text→visual vote.
+                    # (AdaptInfer: language-internal signal; our method: cross-modal proprio.)
+                    if layer_idx < adaptinfer_prune_layer:
+                        new_attention_mask = causal_mask
+                        output_attentions = True
+                        all_self_attns = ()
+                    elif layer_idx == adaptinfer_prune_layer:
+                        attn = layer_outputs[1]   # (1, H, S, S) from previous layer
+                        n_vis = 512
+                        vis_s = 1
+                        vis_e = vis_s + n_vis   # 513
+
+                        last_attn_weights_avg = torch.mean(attn, dim=1)[0]  # (S, S)
+
+                        # text_s: first text token index (after BOS + 512 visual + 1 proprio)
+                        text_s = vis_e + 1   # 514
+
+                        # t2t: each text token's row-mean = how actively it attends outward
+                        text_to_text = last_attn_weights_avg[text_s:, text_s:]  # (n_text, n_text)
+                        text_importance = text_to_text.mean(1)                  # (n_text,) row mean
+                        text_importance_w = text_importance / (text_importance.sum() + 1e-8)
+
+                        # t2v: text→visual attention
+                        text_to_vis = last_attn_weights_avg[text_s:, vis_s:vis_e]  # (n_text, 512)
+
+                        # visual score = t2t-weighted sum of t2v
+                        visual_score = (text_importance_w[:, None] * text_to_vis).sum(0)  # (512,)
+
+                        # per-camera equal split
+                        cam1_keep = visual_score[:256].topk(adaptinfer_k // 2).indices + 1
+                        cam2_keep = visual_score[256:].topk(adaptinfer_k // 2).indices + 1 + 256
+                        keep_vis_rel = torch.cat([cam1_keep, cam2_keep])
+
+                        self.config.adaptinfer_kept_vis_indices = keep_vis_rel.cpu()
+                        self.config.adaptinfer_vis_scores       = visual_score.cpu()
+                        self.config.adaptinfer_text_weights     = text_importance.cpu()
+
+                        keep_indexs = torch.cat((torch.arange(1, device=inputs_embeds.device), keep_vis_rel, torch.arange(1+256*2, inputs_embeds.shape[1], device=inputs_embeds.device)))
+                        keep_indexs = keep_indexs.sort().values
+                        new_seq_length = keep_indexs.shape[0]
+
+                        hidden_states = hidden_states[:, keep_indexs, :]
+                        position_ids  = keep_indexs.unsqueeze(0)
+
+                        cache_position = torch.arange(new_seq_length, device=inputs_embeds.device)
+                        new_attention_mask = self._update_causal_mask(None, hidden_states, cache_position, 0, output_attentions)
+
+                        output_attentions = False
+                        all_self_attns    = None
                 else:
                     new_attention_mask = causal_mask
 
@@ -1385,6 +1510,13 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         efficientvla_k_key: Optional[int] = None,
         efficientvla_alpha: Optional[float] = None,
         efficientvla_prune_layer: Optional[int] = None,
+        use_mine: Optional[bool] = None,
+        mine_prune_layer: Optional[int] = None,
+        mine_k: Optional[int] = None,
+        mine_head_mode: Optional[str] = 'entropy_weighted',
+        use_adaptinfer: Optional[bool] = None,
+        adaptinfer_prune_layer: Optional[int] = None,
+        adaptinfer_k: Optional[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1438,6 +1570,13 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             efficientvla_k_key=efficientvla_k_key,
             efficientvla_alpha=efficientvla_alpha,
             efficientvla_prune_layer=efficientvla_prune_layer,
+            use_mine=use_mine,
+            mine_prune_layer=mine_prune_layer,
+            mine_k=mine_k,
+            mine_head_mode=mine_head_mode,
+            use_adaptinfer=use_adaptinfer,
+            adaptinfer_prune_layer=adaptinfer_prune_layer,
+            adaptinfer_k=adaptinfer_k,
         )
 
         # if output_hidden_states and outputs.hidden_states is not None:
