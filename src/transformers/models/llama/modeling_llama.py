@@ -1022,10 +1022,20 @@ class LlamaModel(LlamaPreTrainedModel):
         use_mine: Optional[bool] = False,
         mine_prune_layer: Optional[int] = None,
         mine_k: Optional[int] = None,
+        mine_jaccard_thresh: Optional[float] = None,
         mine_head_mode: Optional[str] = 'entropy_weighted',
+        mine_score_variant: Optional[str] = 'text',
         use_adaptinfer: Optional[bool] = False,
         adaptinfer_prune_layer: Optional[int] = None,
         adaptinfer_k: Optional[int] = None,
+        use_specprune: Optional[bool] = False,
+        specprune_dynamic_prune: Optional[bool] = True,
+        specprune_precise_mode: Optional[bool] = False,
+        specprune_num_prompt: Optional[int] = None,
+        specprune_high_similarity_indices=None,
+        specprune_high_similarity_indices_wrist=None,
+        specprune_prev_attn_indices=None,
+        specprune_infer_step: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1074,6 +1084,42 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = ()
         next_decoder_cache = None
         last_reusable_patches = None
+
+        if use_mine:
+            # jaccard(layer mine_prune_layer-1's kept top-k, layer mine_prune_layer's) below
+            # this -> defer pruning to a later layer instead. This mirrors the offline
+            # "layer i -> i+1" top-K Jaccard heatmap (visualization/analyze_ablation.py):
+            # low overlap between adjacent layers = the kept set hasn't converged yet at
+            # this depth, so the early layer's proprio/text attention may not be reliable.
+            _mine_jaccard_thresh = mine_jaccard_thresh if mine_jaccard_thresh is not None else 0.40
+            _mine_late_layer = 6
+            _mine_go_late = False
+            _mine_pending_topk = None   # topk snapshot taken one layer before mine_prune_layer
+
+            def _mine_score_and_topk(attn):
+                n_vis, vis_s = 512, 1
+                vis_e = vis_s + n_vis          # 513 (proprio sits here)
+                proprio_pos = vis_e
+                last_attn_weights_avg = torch.mean(attn, dim=1)[0]
+                score = last_attn_weights_avg[1 + 256 * 2 + 1:, proprio_pos]
+                text_to_proprio_w = score / (score.sum() + 1e-8)
+                text_s = vis_e + 1
+                text_to_vis = last_attn_weights_avg[text_s:, vis_s:vis_e]
+                visual_score = (text_to_proprio_w[:, None] * text_to_vis).sum(0)
+                cam1_keep = visual_score[:256].topk(mine_k // 2).indices + 1
+                cam2_keep = visual_score[256:].topk(mine_k // 2).indices + 1 + 256
+                keep_vis_rel = torch.cat([cam1_keep, cam2_keep])
+                return keep_vis_rel, visual_score, score
+            # ── offline diagnostic only (opt-in via config, default off) ───────────
+            # Reproduces the pre-simplification "score at every layer" dump used to
+            # justify choosing between the early (2) and late (6) adaptive probe
+            # layers. Purely additive: never mutates hidden_states/new_attention_mask,
+            # so it has zero effect unless explicitly enabled, and even then only
+            # produces meaningful (full, unpruned token set) scores when the caller
+            # also sets mine_prune_layer beyond the network depth so no real cut
+            # happens during the dump.
+            _mine_dump_layer_scores = getattr(self.config, 'mine_dump_layer_scores', False)
+            _mine_layer_score_store = {} if _mine_dump_layer_scores else None
 
         for layer_idx, decoder_layer in enumerate(self.layers):
 
@@ -1226,55 +1272,63 @@ class LlamaModel(LlamaPreTrainedModel):
                         new_attention_mask = causal_mask
                         output_attentions = True
                         all_self_attns = ()
+                        # ── one-layer-early snapshot: take the topk that layer
+                        # (mine_prune_layer - 1) would have committed, purely to gate
+                        # the real decision at mine_prune_layer against it below.
+                        if layer_idx == mine_prune_layer - 1 and layer_idx > 0:
+                            _mine_pending_topk, _, _ = _mine_score_and_topk(layer_outputs[1])
                     elif layer_idx == mine_prune_layer:
                         # layer_outputs[1]: attention from the previous layer (mine_prune_layer - 1)
                         # shape: (batch=1, H, seq_len, seq_len)
-                        attn = layer_outputs[1]
-                        n_vis    = 512
-                        vis_s    = 1
-                        vis_e    = vis_s + n_vis   # 513  (proprio sits here)
-                        proprio_pos = vis_e        # index of proprio token in sequence
+                        keep_vis_rel, visual_score, score = _mine_score_and_topk(layer_outputs[1])
 
-                        # ── Proprio → Visual attention ────────────────────────────────
-                        # attn[b, head, query, key]: proprio (row) attending to visual (cols)
+                        # ── jaccard gate: compare this layer's kept set against the snapshot
+                        # taken one layer earlier (mine_prune_layer - 1). Low overlap between
+                        # adjacent layers means the kept set hasn't converged at this depth yet
+                        # (see the "layer i -> i+1" heatmap), so defer to a deeper, hopefully
+                        # more reliable layer instead of committing here.
+                        if _mine_pending_topk is not None:
+                            _cur_set  = set(keep_vis_rel.tolist())
+                            _prev_set = set(_mine_pending_topk.tolist())
+                            _mine_jaccard = len(_cur_set & _prev_set) / len(_cur_set | _prev_set)
+                            _mine_go_late = _mine_jaccard < _mine_jaccard_thresh
+                        else:
+                            _mine_go_late = False
 
-                        last_attn_weights_avg = torch.mean(attn, dim=1)[0]
+                        if _mine_go_late:
+                            new_attention_mask = causal_mask
+                            output_attentions = True
+                            all_self_attns = ()
+                        else:
+                            self.config.mine_kept_vis_indices = keep_vis_rel.cpu()
+                            self.config.mine_vis_scores    = visual_score.cpu()  # (512,) per-visual-token score
+                            self.config.mine_phase_weights = score.cpu()         # (n_text,) instruction cursor
 
-                        # score = last_attn_weights_avg[proprio_pos, vis_s:vis_e]   # (H, n_vis)
+                            keep_indexs = torch.cat((torch.arange(1,device=inputs_embeds.device), keep_vis_rel, torch.arange(1+256*2,inputs_embeds.shape[1],device=inputs_embeds.device)))
+                            keep_indexs = keep_indexs.sort().values
+                            new_seq_length = keep_indexs.shape[0]
 
-                        ###                        
-                        score = last_attn_weights_avg[1+256*2+1:, proprio_pos]
-                        
-                        # 1. text_to_proprio를 weighting distribution으로 정규화
-                        text_to_proprio_w = score / (score.sum() + 1e-8)   # (n_text,)
+                            hidden_states = hidden_states[:,keep_indexs,:]
+                            position_ids = keep_indexs.unsqueeze(0)
 
-                        # 2. 각 text token이 visual token에 주는 attention
-                        text_s = vis_e + 1   # 514
-                        text_to_vis = last_attn_weights_avg[text_s:, vis_s:vis_e]  # (n_text, n_vis=512)
+                            cache_position = torch.arange(new_seq_length, device=inputs_embeds.device)
+                            new_attention_mask = self._update_causal_mask(None, hidden_states, cache_position, 0, output_attentions)
 
-                        # 3. proprio를 많이 보는 text token일수록 visual vote에 높은 가중치
-                        visual_score = (text_to_proprio_w[:, None] * text_to_vis).sum(0)  # (512,)
-
-                        # 4. per-camera topk
-                        cam1_keep = visual_score[:256].topk(mine_k // 2).indices + 1
-                        cam2_keep = visual_score[256:].topk(mine_k // 2).indices + 1 + 256
-                        keep_vis_rel = torch.cat([cam1_keep, cam2_keep])
-                        ###
-
-                        # keep_vis_rel = score.topk(mine_k).indices + 1
-                        
-                        # cam1_keep_vis_rel = score[:256].topk(mine_k // 2).indices + 1             # (mine_k,)
-                        # cam2_keep_vis_rel = score[256:].topk(mine_k // 2).indices + 1 + 256
-                        # keep_vis_rel = torch.cat([cam1_keep_vis_rel, cam2_keep_vis_rel])
+                            output_attentions = False
+                            all_self_attns = None
+                    elif layer_idx == _mine_late_layer and _mine_go_late:
+                        # deferred pruning: redo the same scoring using THIS (deeper) layer's
+                        # attention instead of mine_prune_layer's, then commit unconditionally.
+                        keep_vis_rel, visual_score, score = _mine_score_and_topk(layer_outputs[1])
 
                         self.config.mine_kept_vis_indices = keep_vis_rel.cpu()
-                        self.config.mine_vis_scores    = visual_score.cpu()  # (512,) per-visual-token score
-                        self.config.mine_phase_weights = score.cpu()         # (n_text,) instruction cursor
+                        self.config.mine_vis_scores    = visual_score.cpu()
+                        self.config.mine_phase_weights = score.cpu()
 
                         keep_indexs = torch.cat((torch.arange(1,device=inputs_embeds.device), keep_vis_rel, torch.arange(1+256*2,inputs_embeds.shape[1],device=inputs_embeds.device)))
                         keep_indexs = keep_indexs.sort().values
                         new_seq_length = keep_indexs.shape[0]
-                        
+
                         hidden_states = hidden_states[:,keep_indexs,:]
                         position_ids = keep_indexs.unsqueeze(0)
 
@@ -1348,6 +1402,21 @@ class LlamaModel(LlamaPreTrainedModel):
                     cache_position=cache_position,
                 )
 
+            if use_mine and _mine_dump_layer_scores and output_attentions:
+                _attn = layer_outputs[1]
+                _n_vis, _vis_s = 512, 1
+                _vis_e = _vis_s + _n_vis
+                _proprio_pos = _vis_e
+                _seq_len = _attn.shape[-1]
+                if _seq_len > _vis_e + 1:  # proprio + >=1 text token must still be present
+                    _attn_head_mean = torch.mean(_attn, dim=1)[0]
+                    _probe = _attn_head_mean[_proprio_pos + 1:, _proprio_pos]
+                    _probe_w = _probe / (_probe.sum() + 1e-8)
+                    _text_s = _vis_e + 1
+                    _t2v = _attn_head_mean[_text_s:, _vis_s:_vis_e]
+                    _visual_score = (_probe_w[:, None] * _t2v).sum(0)
+                    _mine_layer_score_store[layer_idx] = _visual_score.float().cpu()
+
             hidden_states = layer_outputs[0]
 
             if use_cache:
@@ -1355,6 +1424,9 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
+        if use_mine and _mine_dump_layer_scores:
+            self.config.mine_score_per_layer = _mine_layer_score_store
 
         if hidden_states.shape[1] != 1:
             self.num_forward += 1
@@ -1513,10 +1585,20 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         use_mine: Optional[bool] = None,
         mine_prune_layer: Optional[int] = None,
         mine_k: Optional[int] = None,
+        mine_jaccard_thresh: Optional[float] = None,
         mine_head_mode: Optional[str] = 'entropy_weighted',
+        mine_score_variant: Optional[str] = 'text',
         use_adaptinfer: Optional[bool] = None,
         adaptinfer_prune_layer: Optional[int] = None,
         adaptinfer_k: Optional[int] = None,
+        use_specprune: Optional[bool] = False,
+        specprune_dynamic_prune: Optional[bool] = True,
+        specprune_precise_mode: Optional[bool] = False,
+        specprune_num_prompt: Optional[int] = None,
+        specprune_high_similarity_indices=None,
+        specprune_high_similarity_indices_wrist=None,
+        specprune_prev_attn_indices=None,
+        specprune_infer_step: Optional[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1573,7 +1655,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             use_mine=use_mine,
             mine_prune_layer=mine_prune_layer,
             mine_k=mine_k,
+            mine_jaccard_thresh=mine_jaccard_thresh,
             mine_head_mode=mine_head_mode,
+            mine_score_variant=mine_score_variant,
             use_adaptinfer=use_adaptinfer,
             adaptinfer_prune_layer=adaptinfer_prune_layer,
             adaptinfer_k=adaptinfer_k,
